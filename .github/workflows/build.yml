@@ -1,1 +1,588 @@
+name: Build SMOKE APK
+
+on:
+  push:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Write SMOKE app code
+        run: |
+          cat > settings.gradle.kts <<'SMOKE_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "Smoke"
+          include(":app")
+          SMOKE_EOF
+          cat > build.gradle.kts <<'SMOKE_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          SMOKE_EOF
+          cat > gradle.properties <<'SMOKE_EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          SMOKE_EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'SMOKE_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.faxtra.smoke"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.faxtra.smoke"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          SMOKE_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'SMOKE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.speech.RecognitionService" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.TTS_SERVICE" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/ic_btn_speak_now"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".SmokeService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+              </application>
+          </manifest>
+          SMOKE_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'SMOKE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">SMOKE</string>
+          </resources>
+          SMOKE_EOF
+          mkdir -p app/src/main/java/com/faxtra/smoke
+          cat > app/src/main/java/com/faxtra/smoke/CommandParser.kt <<'SMOKE_EOF'
+          package com.faxtra.smoke
+
+          import android.content.Context
+          import android.content.Intent
+
+          /** Understands "hey smoke, open whatsapp" and finds the app to launch. */
+          object CommandParser {
+
+              // Ways speech recognition may hear "Smoke".
+              private val wakeWords = listOf("smoke", "smokey", "smoky", "smokie")
+
+              sealed class Result {
+                  object None : Result()
+                  object WakeOnly : Result()
+                  data class Open(val appName: String) : Result()
+              }
+
+              /**
+               * @param requireWake if false (just after "Hey Smoke" alone), an "open X" without the wake word is accepted.
+               */
+              fun parse(heard: String, requireWake: Boolean): Result {
+                  val text = heard.lowercase().replace(",", " ").replace(".", " ").trim()
+                  val words = text.split(Regex("\\s+")).filter { it.isNotEmpty() }
+                  val wakeIndex = words.indexOfFirst { it in wakeWords }
+
+                  if (requireWake && wakeIndex < 0) return Result.None
+
+                  val afterWake = if (wakeIndex >= 0) words.drop(wakeIndex + 1) else words
+                  val openIndex = afterWake.indexOfFirst { it == "open" || it == "launch" || it == "start" }
+                  if (openIndex >= 0) {
+                      val name = afterWake.drop(openIndex + 1).joinToString(" ").trim()
+                      if (name.isNotEmpty()) return Result.Open(name)
+                  }
+                  return if (wakeIndex >= 0) Result.WakeOnly else Result.None
+              }
+
+              private fun normalize(s: String): String =
+                  s.lowercase().filter { it.isLetterOrDigit() }
+
+              /** Returns the package name of the best matching installed app, or null. */
+              fun findApp(context: Context, spokenName: String): Pair<String, String>? {
+                  val wanted = normalize(spokenName)
+                  if (wanted.isEmpty()) return null
+
+                  val pm = context.packageManager
+                  val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val apps = pm.queryIntentActivities(launcher, 0).map { info ->
+                      val label = info.loadLabel(pm).toString()
+                      Triple(normalize(label), label, info.activityInfo.packageName)
+                  }
+
+                  apps.firstOrNull { it.first == wanted }?.let { return it.third to it.second }
+                  apps.filter { it.first.startsWith(wanted) }.minByOrNull { it.first.length }
+                      ?.let { return it.third to it.second }
+                  apps.filter { it.first.contains(wanted) }.minByOrNull { it.first.length }
+                      ?.let { return it.third to it.second }
+                  apps.filter { it.first.length >= 3 && wanted.contains(it.first) }.maxByOrNull { it.first.length }
+                      ?.let { return it.third to it.second }
+                  return null
+              }
+          }
+          SMOKE_EOF
+          mkdir -p app/src/main/java/com/faxtra/smoke
+          cat > app/src/main/java/com/faxtra/smoke/SmokeService.kt <<'SMOKE_EOF'
+          package com.faxtra.smoke
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import java.util.Locale
+
+          /** Keeps listening for "Hey Smoke, open ..." while SMOKE is switched on. */
+          class SmokeService : Service(), RecognitionListener {
+
+              companion object {
+                  const val ACTION_STOP = "com.faxtra.smoke.STOP"
+                  private const val CHANNEL_ID = "smoke_listening"
+                  private const val NOTIFICATION_ID = 7
+                  private const val FOLLOW_UP_WINDOW_MS = 8000L
+                  @Volatile var isRunning = false
+              }
+
+              private val handler = Handler(Looper.getMainLooper())
+              private var recognizer: SpeechRecognizer? = null
+              private var tts: TextToSpeech? = null
+              private var ttsReady = false
+              private var listening = false
+              private var awaitingCommandUntil = 0L
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  tts = TextToSpeech(this) { status ->
+                      ttsReady = status == TextToSpeech.SUCCESS
+                      if (ttsReady) tts?.language = Locale.US
+                  }
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_STOP) {
+                      shutDown()
+                      return START_NOT_STICKY
+                  }
+                  goForeground()
+                  if (!isRunning) {
+                      isRunning = true
+                      startListening()
+                  }
+                  return START_STICKY
+              }
+
+              private fun goForeground() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel(CHANNEL_ID, "SMOKE listening", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val stopIntent = PendingIntent.getService(
+                      this, 1,
+                      Intent(this, SmokeService::class.java).setAction(ACTION_STOP),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val openIntent = PendingIntent.getActivity(
+                      this, 2,
+                      Intent(this, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  @Suppress("DEPRECATION")
+                  val notification = Notification.Builder(this, CHANNEL_ID)
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setContentTitle("SMOKE is listening")
+                      .setContentText("Say \"Hey Smoke, open WhatsApp\"")
+                      .setOngoing(true)
+                      .setContentIntent(openIntent)
+                      .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopIntent)
+                      .build()
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  } else {
+                      startForeground(NOTIFICATION_ID, notification)
+                  }
+              }
+
+              private fun startListening() {
+                  if (!isRunning) return
+                  try {
+                      recognizer?.destroy()
+                      recognizer = SpeechRecognizer.createSpeechRecognizer(this).also {
+                          it.setRecognitionListener(this)
+                      }
+                      val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                          putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                          putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.US.toLanguageTag())
+                          putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+                          putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
+                          putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+                      }
+                      listening = true
+                      recognizer?.startListening(intent)
+                  } catch (e: Exception) {
+                      listening = false
+                      restartLater(2000)
+                  }
+              }
+
+              private fun restartLater(delayMs: Long) {
+                  handler.removeCallbacksAndMessages(null)
+                  handler.postDelayed({ startListening() }, delayMs)
+              }
+
+              private fun handle(heardOptions: List<String>) {
+                  val followUp = SystemClock.elapsedRealtime() < awaitingCommandUntil
+                  for (heard in heardOptions) {
+                      when (val result = CommandParser.parse(heard, requireWake = !followUp)) {
+                          is CommandParser.Result.Open -> {
+                              awaitingCommandUntil = 0L
+                              openApp(result.appName)
+                              return
+                          }
+                          is CommandParser.Result.WakeOnly -> {
+                              awaitingCommandUntil = SystemClock.elapsedRealtime() + FOLLOW_UP_WINDOW_MS
+                              speak("Yes?")
+                              restartLater(900)
+                              return
+                          }
+                          CommandParser.Result.None -> Unit
+                      }
+                  }
+                  restartLater(250)
+              }
+
+              private fun openApp(spokenName: String) {
+                  val match = CommandParser.findApp(this, spokenName)
+                  if (match == null) {
+                      speak("I can't find $spokenName")
+                      restartLater(2000)
+                      return
+                  }
+                  val (pkg, label) = match
+                  val launch = packageManager.getLaunchIntentForPackage(pkg)
+                  if (launch == null) {
+                      speak("I can't open $label")
+                      restartLater(2000)
+                      return
+                  }
+                  launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+                  try {
+                      startActivity(launch)
+                      speak("Opening $label")
+                  } catch (e: Exception) {
+                      speak("Android blocked opening $label. Check display over other apps.")
+                  }
+                  restartLater(2000)
+              }
+
+              private fun speak(text: String) {
+                  if (ttsReady) tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "smoke")
+              }
+
+              private fun shutDown() {
+                  isRunning = false
+                  listening = false
+                  handler.removeCallbacksAndMessages(null)
+                  recognizer?.destroy()
+                  recognizer = null
+                  stopForeground(STOP_FOREGROUND_REMOVE)
+                  stopSelf()
+              }
+
+              override fun onDestroy() {
+                  isRunning = false
+                  handler.removeCallbacksAndMessages(null)
+                  recognizer?.destroy()
+                  recognizer = null
+                  tts?.shutdown()
+                  tts = null
+                  super.onDestroy()
+              }
+
+              // --- RecognitionListener ---
+              override fun onResults(results: Bundle?) {
+                  listening = false
+                  val heard = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION).orEmpty()
+                  if (heard.isEmpty()) restartLater(250) else handle(heard)
+              }
+
+              override fun onError(error: Int) {
+                  listening = false
+                  val delay = when (error) {
+                      SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> 1500L
+                      SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> 10000L
+                      SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT, SpeechRecognizer.ERROR_SERVER -> 3000L
+                      else -> 300L
+                  }
+                  restartLater(delay)
+              }
+
+              override fun onReadyForSpeech(params: Bundle?) = Unit
+              override fun onBeginningOfSpeech() = Unit
+              override fun onRmsChanged(rmsdB: Float) = Unit
+              override fun onBufferReceived(buffer: ByteArray?) = Unit
+              override fun onEndOfSpeech() = Unit
+              override fun onPartialResults(partialResults: Bundle?) = Unit
+              override fun onEvent(eventType: Int, params: Bundle?) = Unit
+          }
+          SMOKE_EOF
+          mkdir -p app/src/main/java/com/faxtra/smoke
+          cat > app/src/main/java/com/faxtra/smoke/MainActivity.kt <<'SMOKE_EOF'
+          package com.faxtra.smoke
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.speech.SpeechRecognizer
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+
+              private lateinit var status: TextView
+              private val gold = Color.rgb(242, 184, 48)
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val d = resources.displayMetrics.density
+                  val pad = (24 * d).toInt()
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 2, pad, pad)
+                      setBackgroundColor(Color.rgb(11, 11, 15))
+                  }
+
+                  root.addView(TextView(this).apply {
+                      text = "SMOKE"
+                      textSize = 44f
+                      setTextColor(gold)
+                      typeface = Typeface.DEFAULT_BOLD
+                      gravity = Gravity.CENTER
+                  })
+                  root.addView(TextView(this).apply {
+                      text = "by FA XTRA"
+                      textSize = 16f
+                      setTextColor(Color.rgb(170, 170, 180))
+                      gravity = Gravity.CENTER
+                      setPadding(0, 0, 0, pad)
+                  })
+
+                  status = TextView(this).apply {
+                      textSize = 18f
+                      setTextColor(Color.WHITE)
+                      setPadding(0, 0, 0, pad)
+                  }
+                  root.addView(status)
+
+                  root.addView(Button(this).apply {
+                      text = "Start listening"
+                      textSize = 18f
+                      setOnClickListener { startFlow() }
+                  })
+                  root.addView(Button(this).apply {
+                      text = "Stop"
+                      textSize = 18f
+                      setOnClickListener {
+                          startService(Intent(this@MainActivity, SmokeService::class.java).setAction(SmokeService.ACTION_STOP))
+                          status.text = "Stopped. Tap Start listening to turn SMOKE back on."
+                      }
+                  })
+
+                  root.addView(TextView(this).apply {
+                      textSize = 16f
+                      setTextColor(Color.rgb(200, 200, 210))
+                      setPadding(0, pad, 0, 0)
+                      text = "How to use:\n\n" +
+                          "1. Tap Start listening and allow the microphone and notifications.\n" +
+                          "2. Turn ON \"Allow display over other apps\" for SMOKE (lets it open apps for you), then come back and tap Start listening again.\n" +
+                          "3. Keep the phone unlocked and say: \"Hey Smoke, open WhatsApp\".\n\n" +
+                          "Works with any app: \"Hey Smoke, open YouTube\", \"Hey Smoke, open Maps\".\n" +
+                          "Say just \"Hey Smoke\" and it answers \"Yes?\" - then say \"open WhatsApp\".\n\n" +
+                          "Stop it any time from here or from the SMOKE notification."
+                  })
+
+                  setContentView(ScrollView(this).apply {
+                      setBackgroundColor(Color.rgb(11, 11, 15))
+                      addView(root)
+                  })
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refreshStatus()
+              }
+
+              private fun refreshStatus() {
+                  status.text = when {
+                      SmokeService.isRunning -> "Listening... say \"Hey Smoke, open WhatsApp\"."
+                      !hasMic() -> "Step 1: tap Start listening and allow the microphone."
+                      !Settings.canDrawOverlays(this) -> "Step 2: tap Start listening and turn ON \"Allow display over other apps\"."
+                      else -> "Ready. Tap Start listening."
+                  }
+              }
+
+              private fun hasMic() =
+                  checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+              private fun startFlow() {
+                  if (!hasMic()) {
+                      val perms = mutableListOf(Manifest.permission.RECORD_AUDIO)
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                          perms.add(Manifest.permission.POST_NOTIFICATIONS)
+                      }
+                      requestPermissions(perms.toTypedArray(), 1)
+                      return
+                  }
+                  if (!Settings.canDrawOverlays(this)) {
+                      status.text = "Turn ON \"Allow display over other apps\" for SMOKE, then come back and tap Start listening again."
+                      startActivity(
+                          Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                      )
+                      return
+                  }
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      status.text = "Speech recognition isn't available. Make sure the Google app is installed and turned on."
+                      return
+                  }
+                  startForegroundService(Intent(this, SmokeService::class.java))
+                  status.text = "Listening... say \"Hey Smoke, open WhatsApp\"."
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (hasMic()) startFlow()
+                  else status.text = "SMOKE needs the microphone to hear you. Tap Start listening to try again."
+              }
+          }
+          SMOKE_EOF
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk SMOKE.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SMOKE-apk
+          path: SMOKE.apk
+
+      - name: Publish download link
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: SMOKE build ${{ github.run_number }}
+          files: SMOKE.apk
+          make_latest: true
 
